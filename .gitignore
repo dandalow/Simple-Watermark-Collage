@@ -1,0 +1,4 @@
+# personal settings (folders, last choices) - created next to the exe
+settings.ini
+# the built program is published as a Release, not committed
+*.exe
