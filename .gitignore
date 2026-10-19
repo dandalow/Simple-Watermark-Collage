@@ -2,3 +2,5 @@
 settings.ini
 # the built program is published as a Release, not committed
 *.exe
+# local backups
+*.bak

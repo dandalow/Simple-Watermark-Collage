@@ -7,7 +7,11 @@
 // COLLAGE tab
 // - Up to 10 pictures (the selected ones, or the first 10 in the list) in one of 10 templates; spacing between the
 //   pictures, outer border, rounded corners, background colour, format and width; optional watermark on the collage.
-// Both
+// RENAME tab (Rename.cs)
+// - A small file browser: folders on the left, every folder / picture / file of the open folder in the middle (list or
+//   big thumbnails), tick what to rename. Names from a pattern or typed one by one; same folder = rename (with Undo),
+//   another folder = copies with the new names.
+// All
 // - Add pictures with the buttons or drag & drop them (or whole folders) onto the window or onto Watermark.exe.
 // - The originals are never changed: everything is saved in a folder you choose (never the pictures' own folder for
 //   watermarks); a file that is already there is never replaced, the new one gets " (2)", " (3)"… instead.
@@ -21,8 +25,11 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace CuWatermark
@@ -101,7 +108,7 @@ namespace CuWatermark
 	/* ---------- settings.ini ---------- */
 	class Settings
 	{
-		public string AppMode = "watermark"; // last tab: "watermark" | "collage"
+		public string AppMode = "watermark"; // last tab: "watermark" | "collage" | "rename"
 		public string Mode = "image";       // watermark kind: "image" | "text"
 		public string Mark = "";            // the picture used as image mark (chosen with Choose picture…)
 		public string Text = "comicsuncut.com";
@@ -131,6 +138,25 @@ namespace CuWatermark
 		public bool CFit = false;           // whole pictures (letterboxed) instead of filling the cells
 		public bool CMark = true;           // watermark on the collage
 		public string CType = "JPG";
+		/* rename */
+		public string RPattern = "{folder} - {n}";
+		public int RStart = 1;
+		public int RStep = 1;
+		public int RDigits = 0;             // 0 = as many as the biggest number needs
+		public string RFind = "";
+		public string RReplace = "";
+		public string RCase = "As written";
+		public string RSpaces = "Keep spaces";
+		public bool RExtLower = true;
+		public bool RCopy = false;          // copy to ROut with the new names instead of renaming in place
+		public string RFolder = "";         // the folder open in the rename tab
+		public string ROut = "";            // where the copies go
+		public string RView = "list";       // "list" | "thumbs"
+		public string RShow = "Everything"; // Everything | Pictures | Files | Folders
+		public bool RSub = false;           // files of the subfolders too
+		/* the window, as it was left */
+		public int WinX, WinY, WinW, WinH;
+		public bool WinMax;
 
 		static string IniPath { get { return Path.Combine( AppDomain.CurrentDomain.BaseDirectory, "settings.ini" ); } }
 
@@ -159,7 +185,7 @@ namespace CuWatermark
 					int n;
 					switch ( k )
 					{
-						case "app_mode": s.AppMode = t == "collage" ? "collage" : "watermark"; break;
+						case "app_mode": s.AppMode = t == "collage" || t == "rename" ? t : "watermark"; break;
 						case "mode": s.Mode = t == "text" ? "text" : "image"; break;
 						case "mark": s.Mark = t; break;
 						case "text": s.Text = v; break;
@@ -188,6 +214,29 @@ namespace CuWatermark
 						case "c_fit": s.CFit = t == "1"; break;
 						case "c_mark": s.CMark = t == "1"; break;
 						case "c_type": s.CType = t == "PNG" ? "PNG" : "JPG"; break;
+						case "r_pattern": s.RPattern = v; break;
+						case "r_start": if ( int.TryParse( t, out n ) ) s.RStart = Math.Max( 0, n ); break;
+						case "r_step": if ( int.TryParse( t, out n ) ) s.RStep = Math.Max( 1, n ); break;
+						case "r_digits": if ( int.TryParse( t, out n ) ) s.RDigits = Math.Max( 0, Math.Min( 6, n ) ); break;
+						case "r_find": s.RFind = v; break;
+						case "r_replace": s.RReplace = v; break;
+						case "r_case": if ( Renamer.Cases.Contains( t ) ) s.RCase = t; break;
+						case "r_spaces": if ( Renamer.Spaces.Contains( t ) ) s.RSpaces = t; break;
+						case "r_ext_lower": s.RExtLower = t == "1"; break;
+						case "r_folder": s.RFolder = t; break;
+						case "r_out": s.ROut = t; break;
+						case "r_view": s.RView = t == "thumbs" ? "thumbs" : "list"; break;
+						case "r_show": if ( Renamer.Shows.Contains( t ) ) s.RShow = t; break;
+						case "r_sub": s.RSub = t == "1"; break;
+						case "win":
+							{
+								string[] p = t.Split( ',' );
+								int x, y, w, h;
+								if ( p.Length == 4 && int.TryParse( p[0], out x ) && int.TryParse( p[1], out y ) && int.TryParse( p[2], out w ) && int.TryParse( p[3], out h ) ) { s.WinX = x; s.WinY = y; s.WinW = w; s.WinH = h; }
+								break;
+							}
+						case "win_max": s.WinMax = t == "1"; break;
+						case "r_copy": s.RCopy = t == "1"; break;
 					}
 				}
 			}
@@ -206,7 +255,11 @@ namespace CuWatermark
 					"shadow=" + ( Shadow ? "1" : "0" ), "position=" + Position, "size=" + Size, "opacity=" + Opacity,
 					"margin=" + Margin, "angle=" + Angle, "quality=" + Quality, "out_folder=" + OutFolder,
 					"c_template=" + CTemplate, "c_format=" + CFormat, "c_width=" + CWidth, "c_spacing=" + CSpacing, "c_outer=" + COuter,
-					"c_radius=" + CRadius, "c_bg=" + CBg, "c_fit=" + ( CFit ? "1" : "0" ), "c_mark=" + ( CMark ? "1" : "0" ), "c_type=" + CType } );
+					"c_radius=" + CRadius, "c_bg=" + CBg, "c_fit=" + ( CFit ? "1" : "0" ), "c_mark=" + ( CMark ? "1" : "0" ), "c_type=" + CType,
+					"r_pattern=" + RPattern, "r_start=" + RStart, "r_step=" + RStep, "r_digits=" + RDigits, "r_find=" + RFind, "r_replace=" + RReplace,
+					"r_case=" + RCase, "r_spaces=" + RSpaces, "r_ext_lower=" + ( RExtLower ? "1" : "0" ),
+					"r_copy=" + ( RCopy ? "1" : "0" ), "r_folder=" + RFolder, "r_out=" + ROut, "r_view=" + RView, "r_show=" + RShow, "r_sub=" + ( RSub ? "1" : "0" ),
+					"win=" + WinX + "," + WinY + "," + WinW + "," + WinH, "win_max=" + ( WinMax ? "1" : "0" ) } );
 			}
 			catch { }
 		}
@@ -657,12 +710,15 @@ namespace CuWatermark
 	}
 
 	/* ---------- the window ---------- */
-	class MainForm : Form
+	partial class MainForm : Form // the RENAME tab is in Rename.cs
 	{
-		static readonly Color BG = Color.FromArgb( 11, 13, 16 ), PANEL = Color.FromArgb( 21, 25, 30 ), FIELD = Color.FromArgb( 15, 18, 21 ),
-			HEAD = Color.FromArgb( 9, 10, 13 ), LINE = Color.FromArgb( 42, 48, 56 ), TEXT = Color.FromArgb( 230, 235, 240 ),
-			MUTED = Color.FromArgb( 138, 151, 163 ), PINK = Color.FromArgb( 255, 51, 102 ), GREEN = Color.FromArgb( 74, 222, 128 ),
-			AMBER = Color.FromArgb( 255, 176, 32 ), BTN = Color.FromArgb( 30, 35, 42 ), CELL = Color.FromArgb( 58, 66, 78 );
+		/* dark slate blue, not black; pink and purple for what matters */
+		static readonly Color BG = Color.FromArgb( 17, 21, 31 ), PANEL = Color.FromArgb( 23, 28, 41 ), FIELD = Color.FromArgb( 13, 17, 26 ),
+			HEAD = Color.FromArgb( 12, 15, 23 ), LINE = Color.FromArgb( 50, 58, 78 ), TEXT = Color.FromArgb( 232, 236, 244 ),
+			MUTED = Color.FromArgb( 146, 158, 180 ), PINK = Color.FromArgb( 255, 51, 102 ), GREEN = Color.FromArgb( 74, 222, 128 ),
+			AMBER = Color.FromArgb( 255, 176, 32 ), BTN = Color.FromArgb( 40, 48, 68 ), CELL = Color.FromArgb( 64, 74, 96 ),
+			CARD = Color.FromArgb( 30, 36, 52 ), PURPLE = Color.FromArgb( 150, 70, 230 );
+		const int SIDE_W = 300; // the pictures list and the folders panel: the same width, so nothing jumps between the tabs
 
 		readonly Settings S;
 		readonly List<string> files = new List<string>();
@@ -682,34 +738,46 @@ namespace CuWatermark
 		ComboBox cPos, cFont, cFormat, cWidth, cType;
 		TextBox tText;
 		CheckBox kBold, kItalic, kOutline, kShadow, kFit, kMark;
-		Button bModeImage, bModeText, bColor, bOutColor, bApply, bOpen, bOpen2, bBg, bSaveCollage, bTabWm, bTabCol;
-		ProgressBar prog;
-		Panel header, left, center, secImage, secText;
-		FlowLayoutPanel right, rightCol;
+		Button bModeImage, bModeText, bColor, bOutColor, bApply, bOpen, bOpen2, bBg, bSaveCollage;
+		SlimBar prog;
+		Panel nav, pageBar, statusBar, left, center, secImage, secText;
+		NavButton navWm, navCol, navRen;
+		Label pageTitle, pageSub;
+		FlowLayoutPanel toolWm, toolCol, toolRen;
+		FlowLayoutPanel right, rightCol, rightRen;
 		readonly List<Panel> tiles = new List<Panel>();
-
 		public MainForm( string[] args )
 		{
 			S = Settings.Load();
-			Text = "ComicsUncut Watermark & Collage";
+			Text = "ComicsUncut Watermark, Collage & Rename";
 			try { Icon = Icon.ExtractAssociatedIcon( Application.ExecutablePath ); } catch { }
 			BackColor = BG;
 			ForeColor = TEXT;
 			Font = new Font( "Segoe UI", 9.75f );
-			ClientSize = new Size( 1280, 840 );
-			MinimumSize = new Size( 1080, 720 );
-			StartPosition = FormStartPosition.CenterScreen;
+			MinimumSize = new Size( 1240, 760 );
+			PlaceWindow();
 			AllowDrop = true;
 			DragEnter += OnDragEnter;
 			DragDrop += OnDragDrop;
 
-			BuildHeader();
+			BuildShell();
 			BuildLeft();
 			BuildRight();
 			BuildCollagePanel();
+			BuildRenamePanel();
 			BuildCenter();
-			header.SendToBack();   // docked first: full width on top
-			center.BringToFront(); // docked last: fills what is left
+			BuildRenameCenter();
+			/* docking order: status bar (full width, bottom), side menu (full height), page header, then the panels */
+			center.BringToFront();
+			pageBar.SendToBack();
+			nav.SendToBack();
+			statusBar.SendToBack();
+			center.Controls.Remove( info ); // the summary line lives in the status bar
+			info.Dock = DockStyle.Fill;
+			info.TextAlign = ContentAlignment.MiddleLeft;
+			info.Padding = new Padding( 14, 0, 0, 0 );
+			statusBar.Controls.Add( info );
+			info.BringToFront();
 
 			redraw.Interval = 90;
 			redraw.Tick += delegate { redraw.Stop(); RenderPreview(); };
@@ -723,10 +791,34 @@ namespace CuWatermark
 			LoadMark();
 			SetTab( S.AppMode );
 			AddPaths( args );
-			FormClosing += delegate { SaveSettings(); };
+			FormClosing += delegate { RememberWindow(); SaveSettings(); };
+		}
+
+		/* the window opens where and as big as it was left (maximized too); the first time: big, centred */
+		void PlaceWindow()
+		{
+			Rectangle work = Screen.PrimaryScreen.WorkingArea;
+			Rectangle saved = new Rectangle( S.WinX, S.WinY, S.WinW, S.WinH );
+			bool onScreen = S.WinW >= MinimumSize.Width && S.WinH >= MinimumSize.Height && Screen.AllScreens.Any( s => s.WorkingArea.IntersectsWith( saved ) );
+			StartPosition = FormStartPosition.Manual;
+			if ( onScreen ) Bounds = saved;
+			else
+			{
+				Size sz = new Size( Math.Min( 1500, work.Width - 40 ), Math.Min( 940, work.Height - 40 ) );
+				Bounds = new Rectangle( work.X + ( work.Width - sz.Width ) / 2, work.Y + ( work.Height - sz.Height ) / 2, sz.Width, sz.Height );
+			}
+			if ( S.WinMax || ( !onScreen && ( work.Width < 1500 || work.Height < 940 ) ) ) WindowState = FormWindowState.Maximized;
+		}
+
+		void RememberWindow()
+		{
+			Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+			S.WinMax = WindowState == FormWindowState.Maximized;
+			if ( WindowState != FormWindowState.Minimized || b.Width > 0 ) { S.WinX = b.X; S.WinY = b.Y; S.WinW = b.Width; S.WinH = b.Height; }
 		}
 
 		bool IsCollage { get { return S.AppMode == "collage"; } }
+		bool IsRename { get { return S.AppMode == "rename"; } }
 
 		/* ---------- small builders ---------- */
 		Label MakeLabel( Control parent, string text, int x, int y, Color color, float size, bool bold )
@@ -744,7 +836,7 @@ namespace CuWatermark
 
 		Button MakeButton( Control parent, string text, int x, int y, int w, int h, bool primary )
 		{
-			Button b = new Button();
+			Button b = new RoundButton();
 			b.Text = text;
 			b.Location = new Point( x, y );
 			b.Size = new Size( w, h );
@@ -753,8 +845,8 @@ namespace CuWatermark
 			b.ForeColor = Color.White;
 			b.BackColor = primary ? PINK : BTN;
 			b.FlatAppearance.BorderColor = primary ? PINK : LINE;
-			b.FlatAppearance.MouseOverBackColor = primary ? Color.FromArgb( 255, 82, 123 ) : Color.FromArgb( 45, 30, 40 );
-			b.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb( 224, 30, 82 ) : Color.FromArgb( 60, 35, 48 );
+			b.FlatAppearance.MouseOverBackColor = primary ? Color.FromArgb( 255, 82, 123 ) : Color.FromArgb( 56, 66, 92 );
+			b.FlatAppearance.MouseDownBackColor = primary ? Color.FromArgb( 224, 30, 82 ) : Color.FromArgb( 70, 80, 110 );
 			b.Font = new Font( "Segoe UI Semibold", primary ? 11f : 9.5f );
 			parent.Controls.Add( b );
 			return b;
@@ -782,7 +874,7 @@ namespace CuWatermark
 			t.TickStyle = TickStyle.None;
 			t.Location = new Point( 6, y );
 			t.Width = 268;
-			t.BackColor = PANEL;
+			t.BackColor = parent.BackColor; // the card's colour
 			t.ValueChanged += delegate { SyncLabels(); QueueRedraw(); };
 			parent.Controls.Add( t );
 			return t;
@@ -804,13 +896,43 @@ namespace CuWatermark
 			return c;
 		}
 
+		TextBox MakeBox( Control parent, int x, int y, int w, string text )
+		{
+			TextBox t = new TextBox();
+			t.Location = new Point( x, y );
+			t.Width = w;
+			t.BackColor = FIELD;
+			t.ForeColor = TEXT;
+			t.BorderStyle = BorderStyle.FixedSingle;
+			t.Text = text;
+			t.TextChanged += delegate { QueueRedraw(); };
+			parent.Controls.Add( t );
+			return t;
+		}
+
+		NumericUpDown MakeNum( Control parent, int x, int y, int w, int min, int max, int val )
+		{
+			NumericUpDown n = new NumericUpDown();
+			n.Location = new Point( x, y );
+			n.Width = w;
+			n.Minimum = min;
+			n.Maximum = max;
+			n.Value = Math.Max( min, Math.Min( max, val ) );
+			n.BackColor = FIELD;
+			n.ForeColor = TEXT;
+			n.BorderStyle = BorderStyle.FixedSingle;
+			n.ValueChanged += delegate { QueueRedraw(); };
+			parent.Controls.Add( n );
+			return n;
+		}
+
 		/* one block of a settings column */
 		Panel Section( FlowLayoutPanel column, int height )
 		{
-			Panel p = new Panel();
+			RoundPanel p = new RoundPanel(); // a rounded card
 			p.Size = new Size( 280, height );
-			p.Margin = new Padding( 0 );
-			p.BackColor = PANEL;
+			p.Margin = new Padding( 0, 0, 0, 6 );
+			p.Fill = p.BackColor = CARD;
 			column.Controls.Add( p );
 			return p;
 		}
@@ -850,43 +972,160 @@ namespace CuWatermark
 		}
 
 		/* ---------- layout ---------- */
-		void BuildHeader()
+		/* the frame of the app: side menu, page header with its toolbar, status bar */
+		void BuildShell()
 		{
-			Panel h = new Panel();
-			header = h;
-			h.Dock = DockStyle.Top;
-			h.Height = 58;
-			h.BackColor = HEAD;
-			h.Paint += delegate( object o, PaintEventArgs e ) { using ( Pen p = new Pen( Color.FromArgb( 90, 255, 51, 102 ) ) ) e.Graphics.DrawLine( p, 0, h.Height - 1, h.Width, h.Height - 1 ); };
-			MakeLabel( h, "COMICS UNCUT", 18, 14, PINK, 15f, true );
-			bTabWm = MakeButton( h, "WATERMARK", 190, 12, 136, 34, false );
-			bTabCol = MakeButton( h, "COLLAGE", 332, 12, 136, 34, false );
-			bTabWm.Click += delegate { SetTab( "watermark" ); };
-			bTabCol.Click += delegate { SetTab( "collage" ); };
-			Label hint = MakeLabel( h, "Drop pictures or folders anywhere in this window", 0, 22, MUTED, 9f, false );
-			hint.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-			h.Resize += delegate { hint.Left = h.Width - hint.Width - 18; };
-			Controls.Add( h );
+			/* side menu: logo, the three tools, a hint at the bottom */
+			nav = new Panel();
+			nav.Dock = DockStyle.Left;
+			nav.Width = 232;
+			nav.Paint += delegate( object o, PaintEventArgs e )
+			{
+				using ( LinearGradientBrush b = new LinearGradientBrush( nav.ClientRectangle, Color.FromArgb( 46, 22, 66 ), Color.FromArgb( 16, 19, 30 ), 90f ) )
+					e.Graphics.FillRectangle( b, nav.ClientRectangle );
+				using ( Pen p = new Pen( Color.FromArgb( 60, 255, 255, 255 ) ) ) e.Graphics.DrawLine( p, nav.Width - 1, 0, nav.Width - 1, nav.Height );
+			};
+			typeof( Control ).GetProperty( "DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic ).SetValue( nav, true, null );
+			nav.Resize += delegate { nav.Invalidate(); };
+			Panel logo = new Panel();
+			logo.Location = new Point( 18, 22 );
+			logo.Size = new Size( 44, 44 );
+			logo.BackColor = Color.Transparent;
+			logo.Paint += delegate( object o, PaintEventArgs e )
+			{
+				e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+				using ( GraphicsPath p = Collage.Round( new RectangleF( 0, 0, 43, 43 ), 12 ) )
+				using ( LinearGradientBrush b = new LinearGradientBrush( new Rectangle( 0, 0, 44, 44 ), PINK, PURPLE, 45f ) )
+					e.Graphics.FillPath( b, p );
+				using ( Font f = new Font( "Segoe UI", 15f, FontStyle.Bold ) )
+					TextRenderer.DrawText( e.Graphics, "CU", f, new Rectangle( 0, 0, 44, 44 ), Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter );
+			};
+			nav.Controls.Add( logo );
+			MakeLabel( nav, "Comics Uncut", 70, 22, Color.White, 13f, true );
+			MakeLabel( nav, "Studio  ·  pictures toolkit", 72, 47, Color.FromArgb( 200, 190, 220 ), 8.5f, false );
+			MakeLabel( nav, "TOOLS", 22, 98, Color.FromArgb( 170, 160, 200 ), 8f, true );
+			navWm = NavItem( Look.Font, "Watermark", "Logo or text on many pictures", 122, "watermark" );
+			navCol = NavItem( Look.Grid, "Collage", "Up to 10 pictures on one page", 190, "collage" );
+			navRen = NavItem( Look.Rename, "Rename", "Name many files your way", 258, "rename" );
+			Label tip = MakeLabel( nav, "Tip: drop pictures or folders\nanywhere in the window.", 22, 0, Color.FromArgb( 170, 160, 200 ), 8.25f, false );
+			nav.Resize += delegate { tip.Top = nav.Height - tip.Height - 20; };
+			Controls.Add( nav );
+
+			/* page header: title, one line about it, the page's buttons on the right */
+			pageBar = new Panel();
+			pageBar.Dock = DockStyle.Top;
+			pageBar.Height = 78;
+			pageBar.BackColor = BG;
+			pageBar.Paint += delegate( object o, PaintEventArgs e ) { using ( Pen p = new Pen( LINE ) ) e.Graphics.DrawLine( p, 0, pageBar.Height - 1, pageBar.Width, pageBar.Height - 1 ); };
+			pageTitle = MakeLabel( pageBar, "", 24, 12, Color.White, 18f, true );
+			pageSub = MakeLabel( pageBar, "", 26, 48, MUTED, 9.25f, false );
+			toolWm = Toolbar();
+			ToolButton( toolWm, Look.Picture, "Add pictures", false ).Click += delegate { AddFromDialog(); };
+			ToolButton( toolWm, Look.FolderOpen, "Add folder", false ).Click += delegate { AddFolderDialog(); };
+			ToolButton( toolWm, Look.Delete, "Clear list", false ).Click += delegate { files.Clear(); RefreshList(); };
+			ToolButton( toolWm, Look.Play, "Apply watermark", true ).Click += delegate { Start(); };
+			toolCol = Toolbar();
+			ToolButton( toolCol, Look.Picture, "Add pictures", false ).Click += delegate { AddFromDialog(); };
+			ToolButton( toolCol, Look.FolderOpen, "Add folder", false ).Click += delegate { AddFolderDialog(); };
+			ToolButton( toolCol, Look.Delete, "Clear list", false ).Click += delegate { files.Clear(); RefreshList(); };
+			ToolButton( toolCol, Look.Save, "Save collage", true ).Click += delegate { SaveCollage(); };
+			toolRen = Toolbar();
+			ToolButton( toolRen, Look.FolderOpen, "Open folder…", false ).Click += delegate { BrowseRenFolder(); };
+			ToolButton( toolRen, Look.Refresh, "Refresh", false ).Click += delegate { ReloadFolder(); };
+			ToolButton( toolRen, Look.Explorer, "Show in Explorer", false ).Click += delegate { if ( Directory.Exists( renFolder ) ) Process.Start( "explorer.exe", "\"" + renFolder + "\"" ); };
+			ToolButton( toolRen, Look.Undo, "Undo", false ).Click += delegate { DoUndo(); };
+			ToolButton( toolRen, Look.Rename, "Rename", true ).Click += delegate { DoRename(); };
+			pageBar.Resize += delegate { PlaceToolbars(); };
+			Controls.Add( pageBar );
+
+			/* status bar */
+			statusBar = new Panel();
+			statusBar.Dock = DockStyle.Bottom;
+			statusBar.Height = 30;
+			statusBar.BackColor = HEAD;
+			statusBar.Paint += delegate( object o, PaintEventArgs e ) { using ( Pen p = new Pen( LINE ) ) e.Graphics.DrawLine( p, 0, 0, statusBar.Width, 0 ); };
+			Label right = MakeLabel( statusBar, "Settings are saved automatically", 0, 7, Color.FromArgb( 110, 122, 146 ), 8.5f, false );
+			right.Dock = DockStyle.Right;
+			right.Padding = new Padding( 0, 6, 16, 0 );
+			Controls.Add( statusBar );
+		}
+
+		NavButton NavItem( string glyph, string title, string sub, int y, string tab )
+		{
+			NavButton b = new NavButton();
+			b.Glyph = glyph;
+			b.Title = title;
+			b.Sub = sub;
+			b.Location = new Point( 12, y );
+			b.Width = 208;
+			b.Click += delegate { SetTab( tab ); };
+			nav.Controls.Add( b );
+			return b;
+		}
+
+		FlowLayoutPanel Toolbar()
+		{
+			FlowLayoutPanel t = new FlowLayoutPanel();
+			t.WrapContents = false;
+			t.BackColor = BG;
+			t.Padding = Padding.Empty;
+			t.Height = 38;
+			t.Width = 0;
+			t.Visible = false;
+			pageBar.Controls.Add( t );
+			return t;
+		}
+
+		Button ToolButton( FlowLayoutPanel bar, string glyph, string text, bool primary )
+		{
+			RoundButton b = (RoundButton) MakeButton( bar, text, 0, 0, 100, 38, primary );
+			b.Font = new Font( "Segoe UI Semibold", 9.5f );
+			b.Glyph = glyph;
+			b.FitWidth( 16 );
+			b.Margin = new Padding( bar.Controls.Count == 1 ? 0 : 8, 0, 0, 0 );
+			bar.Width += b.Width + b.Margin.Left;
+			return b;
+		}
+
+		/* the page's buttons: right side of the header, in the middle of its height; the subtitle stops before them */
+		void PlaceToolbars()
+		{
+			foreach ( FlowLayoutPanel t in new FlowLayoutPanel[] { toolWm, toolCol, toolRen } )
+			{
+				t.Left = pageBar.Width - t.Width - 20;
+				t.Top = ( pageBar.Height - t.Height ) / 2;
+			}
+			FlowLayoutPanel shown = IsRename ? toolRen : IsCollage ? toolCol : toolWm;
+			pageSub.AutoSize = false;
+			pageSub.AutoEllipsis = true;
+			pageSub.Width = Math.Max( 120, shown.Left - pageSub.Left - 24 );
+			pageSub.Height = 20;
 		}
 
 		void BuildLeft()
 		{
 			left = new Panel();
 			left.Dock = DockStyle.Left;
-			left.Width = 330;
+			left.Width = SIDE_W;
 			left.BackColor = PANEL;
 
-			MakeLabel( left, "PICTURES", 14, 14, MUTED, 9f, true );
-			MakeButton( left, "+  Pictures", 14, 40, 146, 34, false ).Click += delegate { AddFromDialog(); };
-			MakeButton( left, "+  Folder", 168, 40, 146, 34, false ).Click += delegate { AddFolderDialog(); };
-			MakeButton( left, "Remove", 14, 80, 146, 30, false ).Click += delegate { RemoveSelected(); };
-			MakeButton( left, "Clear", 168, 80, 146, 30, false ).Click += delegate { files.Clear(); RefreshList(); };
-			MakeButton( left, "▲  Up", 14, 116, 146, 30, false ).Click += delegate { MoveSelected( -1 ); };
-			MakeButton( left, "▼  Down", 168, 116, 146, 30, false ).Click += delegate { MoveSelected( 1 ); };
+			MakeLabel( left, "PICTURES", 16, 16, MUTED, 9f, true );
+			Button[] tools = {
+				MakeButton( left, "Add", 16, 42, 129, 34, false ), MakeButton( left, "Folder", 153, 42, 129, 34, false ),
+				MakeButton( left, "Up", 16, 82, 129, 32, false ), MakeButton( left, "Down", 153, 82, 129, 32, false ),
+				MakeButton( left, "Remove", 16, 120, 129, 32, false ), MakeButton( left, "Clear", 153, 120, 129, 32, false ) };
+			string[] icons = { Look.Picture, Look.FolderOpen, Look.Up, Look.Down, Look.Close, Look.Delete };
+			for ( int i = 0; i < tools.Length; i++ ) ( (RoundButton) tools[i] ).Glyph = icons[i];
+			tools[0].Click += delegate { AddFromDialog(); };
+			tools[1].Click += delegate { AddFolderDialog(); };
+			tools[2].Click += delegate { MoveSelected( -1 ); };
+			tools[3].Click += delegate { MoveSelected( 1 ); };
+			tools[4].Click += delegate { RemoveSelected(); };
+			tools[5].Click += delegate { files.Clear(); RefreshList(); };
 
 			list = new ListBox();
-			list.Location = new Point( 14, 158 );
-			list.Size = new Size( 300, 520 );
+			list.Location = new Point( 16, 164 );
+			list.Size = new Size( 266, 520 );
 			list.BackColor = FIELD;
 			list.ForeColor = TEXT;
 			list.BorderStyle = BorderStyle.None;
@@ -902,8 +1141,8 @@ namespace CuWatermark
 			list.DragDrop += OnDragDrop;
 			left.Controls.Add( list );
 
-			count = MakeLabel( left, "No pictures yet", 14, 0, MUTED, 9f, false );
-			left.Resize += delegate { count.Top = left.Height - 30; list.Height = left.Height - 158 - 40; };
+			count = MakeLabel( left, "No pictures yet", 16, 0, MUTED, 9f, false );
+			left.Resize += delegate { count.Top = left.Height - 30; list.Height = left.Height - 164 - 40; };
 			Controls.Add( left );
 		}
 
@@ -998,10 +1237,9 @@ namespace CuWatermark
 			Panel pa = Section( right, 150 );
 			bApply = MakeButton( pa, "APPLY WATERMARK", 8, 6, 266, 48, true );
 			bApply.Click += delegate { Start(); };
-			prog = new ProgressBar();
+			prog = new SlimBar();
 			prog.Location = new Point( 8, 62 );
-			prog.Size = new Size( 266, 8 );
-			prog.Style = ProgressBarStyle.Continuous;
+			prog.Size = new Size( 266, 6 );
 			pa.Controls.Add( prog );
 			status = MakeLabel( pa, "", 8, 76, MUTED, 8.75f, false );
 			status.AutoSize = false;
@@ -1200,12 +1438,31 @@ namespace CuWatermark
 		/* ---------- state ---------- */
 		void SetTab( string tab )
 		{
-			S.AppMode = tab == "collage" ? "collage" : "watermark";
-			right.Visible = !IsCollage;
+			S.AppMode = tab == "collage" || tab == "rename" ? tab : "watermark";
+			bool wm = !IsCollage && !IsRename;
+			SuspendLayout(); // the panels change in one go: the same widths in every tab, nothing jumps
+			right.Visible = wm;
 			rightCol.Visible = IsCollage;
-			StyleToggle( bTabWm, !IsCollage );
-			StyleToggle( bTabCol, IsCollage );
+			renRight.Visible = IsRename;
+			left.Visible = !IsRename;    // the rename tab has its own folders panel and file list
+			renLeft.Visible = IsRename;
+			preview.Visible = !IsRename;
+			renWrap.Visible = IsRename;
+			toolWm.Visible = wm;
+			toolCol.Visible = IsCollage;
+			toolRen.Visible = IsRename;
+			navWm.Selected = wm;
+			navCol.Selected = IsCollage;
+			navRen.Selected = IsRename;
+			pageTitle.Text = wm ? "Watermark" : IsCollage ? "Collage" : "Rename";
+			pageSub.Text = wm ? "Put your logo or a text on many pictures at once — the originals are never changed"
+				: IsCollage ? "Up to 10 pictures on one page, 10 templates — pick the pictures in the list, the first one gets the big spot"
+				: "Rename or copy many files at once — with a pattern, or double-click a file and give it any name";
+			PlaceToolbars();
+			ResumeLayout( true );
+			if ( IsRename && renFolder == "" ) OpenFolder( Directory.Exists( S.RFolder ) ? S.RFolder : Environment.GetFolderPath( Environment.SpecialFolder.Desktop ) );
 			if ( IsCollage ) { RepaintTiles(); QueueRedraw(); }
+			else if ( IsRename ) QueueRedraw();
 			else LoadPreviewBase();
 		}
 
@@ -1259,6 +1516,7 @@ namespace CuWatermark
 			S.CFit = kFit.Checked;
 			S.CMark = kMark.Checked;
 			S.CType = cType.SelectedItem == null ? "JPG" : cType.SelectedItem.ToString();
+			ReadRenameSettings();
 		}
 
 		void SaveSettings()
@@ -1346,7 +1604,7 @@ namespace CuWatermark
 				}
 			}
 			RefreshList();
-			if ( files.Count > before && list.SelectedIndex < 0 && files.Count > 0 && !IsCollage ) list.SelectedIndex = before;
+			if ( files.Count > before && list.SelectedIndex < 0 && files.Count > 0 && !IsCollage && !IsRename ) list.SelectedIndex = before;
 		}
 
 		void AddFromDialog()
@@ -1400,6 +1658,7 @@ namespace CuWatermark
 			count.Text = files.Count == 0 ? "No pictures yet" : files.Count + ( files.Count == 1 ? " picture" : " pictures" );
 			foreach ( string k in thumbs.Keys.Where( k => !files.Contains( k ) ).ToList() ) { thumbs[k].Dispose(); thumbs.Remove( k ); }
 			if ( IsCollage ) { RepaintTiles(); QueueRedraw(); }
+			else if ( IsRename ) QueueRedraw();
 			else if ( files.Count == 0 ) LoadPreviewBase();
 		}
 
@@ -1466,14 +1725,16 @@ namespace CuWatermark
 		void OnDragDrop( object sender, DragEventArgs e )
 		{
 			string[] p = e.Data.GetData( DataFormats.FileDrop ) as string[];
-			if ( p != null ) AddPaths( p );
+			if ( p == null ) return;
+			if ( IsRename ) RenameDrop( p );
+			else AddPaths( p );
 		}
 
 		/* ---------- preview ---------- */
 		void LoadPreviewBase()
 		{
 			if ( previewBase != null ) { previewBase.Dispose(); previewBase = null; }
-			if ( IsCollage ) { QueueRedraw(); return; }
+			if ( IsCollage || IsRename ) { QueueRedraw(); return; }
 			int i = list.SelectedIndex;
 			if ( i < 0 || i >= files.Count ) { SetPreview( null ); info.Text = ""; return; }
 			try
@@ -1520,6 +1781,7 @@ namespace CuWatermark
 		void RenderPreview()
 		{
 			ReadSettings();
+			if ( IsRename ) { UpdateNames(); return; }
 			if ( IsCollage )
 			{
 				List<string> use = CollageFiles();
@@ -1619,8 +1881,8 @@ namespace CuWatermark
 			bApply.Enabled = false;
 			bApply.Text = "WORKING…";
 			bOpen.Visible = false;
+			prog.Reset();
 			prog.Maximum = job.Files.Count;
-			prog.Value = 0;
 			status.ForeColor = MUTED;
 			worker.RunWorkerAsync( job );
 		}
